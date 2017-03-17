@@ -14,10 +14,13 @@ namespace CachetHQ\Cachet\Bus\Handlers\Commands\Incident;
 use CachetHQ\Cachet\Bus\Commands\Component\UpdateComponentCommand;
 use CachetHQ\Cachet\Bus\Commands\Incident\ReportIncidentCommand;
 use CachetHQ\Cachet\Bus\Events\Incident\IncidentWasReportedEvent;
-use CachetHQ\Cachet\Dates\DateFactory;
+use CachetHQ\Cachet\Bus\Exceptions\Incident\InvalidIncidentTimestampException;
 use CachetHQ\Cachet\Models\Component;
 use CachetHQ\Cachet\Models\Incident;
 use CachetHQ\Cachet\Models\IncidentTemplate;
+use CachetHQ\Cachet\Services\Dates\DateFactory;
+use Carbon\Carbon;
+use Illuminate\Contracts\Auth\Guard;
 use Twig_Environment;
 use Twig_Loader_Array;
 
@@ -29,21 +32,30 @@ use Twig_Loader_Array;
 class ReportIncidentCommandHandler
 {
     /**
+     * The authentication guard instance.
+     *
+     * @var \Illuminate\Contracts\Auth\Guard
+     */
+    protected $auth;
+
+    /**
      * The date factory instance.
      *
-     * @var \CachetHQ\Cachet\Dates\DateFactory
+     * @var \CachetHQ\Cachet\Services\Dates\DateFactory
      */
     protected $dates;
 
     /**
      * Create a new report incident command handler instance.
      *
-     * @param \CachetHQ\Cachet\Dates\DateFactory $dates
+     * @param \Illuminate\Contracts\Auth\Guard            $auth
+     * @param \CachetHQ\Cachet\Services\Dates\DateFactory $dates
      *
      * @return void
      */
-    public function __construct(DateFactory $dates)
+    public function __construct(Guard $auth, DateFactory $dates)
     {
+        $this->auth = $auth;
         $this->dates = $dates;
     }
 
@@ -63,7 +75,7 @@ class ReportIncidentCommandHandler
             'stickied' => $command->stickied,
         ];
 
-        if ($template = IncidentTemplate::where('slug', $command->template)->first()) {
+        if ($template = IncidentTemplate::where('slug', '=', $command->template)->first()) {
             $data['message'] = $this->parseTemplate($template, $command);
         } else {
             $data['message'] = $command->message;
@@ -75,11 +87,14 @@ class ReportIncidentCommandHandler
         }
 
         // The incident occurred at a different time.
-        if ($command->incident_date) {
-            $incidentDate = $this->dates->create('d/m/Y H:i', $command->incident_date);
-
-            $data['created_at'] = $incidentDate;
-            $data['updated_at'] = $incidentDate;
+        if ($occurredAt = $command->occurred_at) {
+            if ($date = $this->dates->create('Y-m-d H:i', $occurredAt)) {
+                $data['occurred_at'] = $date;
+            } else {
+                throw new InvalidIncidentTimestampException("Unable to pass timestamp {$occurredAt}");
+            }
+        } else {
+            $data['occurred_at'] = Carbon::now();
         }
 
         // Create the incident
@@ -95,13 +110,13 @@ class ReportIncidentCommandHandler
                 null,
                 null,
                 null,
-                null
+                null,
+                null,
+                false
             ));
         }
 
-        $incident->notify = (bool) $command->notify;
-
-        event(new IncidentWasReportedEvent($incident));
+        event(new IncidentWasReportedEvent($this->auth->user(), $incident, (bool) $command->notify));
 
         return $incident;
     }
@@ -127,7 +142,7 @@ class ReportIncidentCommandHandler
                 'visible'          => $command->visible,
                 'notify'           => $command->notify,
                 'stickied'         => $command->stickied,
-                'incident_date'    => $command->incident_date,
+                'occurred_at'      => $command->occurred_at,
                 'component'        => Component::find($command->component_id) ?: null,
                 'component_status' => $command->component_status,
             ],
